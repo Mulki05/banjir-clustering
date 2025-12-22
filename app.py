@@ -1,184 +1,193 @@
-import streamlit as st
-import pandas as pd
+import io, re, pickle
 import numpy as np
-import pickle
+import pandas as pd
+import streamlit as st
 import matplotlib.pyplot as plt
 import seaborn as sns
+
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 
-st.set_page_config(page_title="Dashboard Klasterisasi Banjir DKI Jakarta", layout="wide")
+st.set_page_config(page_title="Klasterisasi Banjir DKI", layout="wide")
 
-FITUR = [
+FEATURES = [
     "ketinggian_air_cm",
     "jumlah_terdampak_rt",
     "jumlah_terdampak_kk",
     "jumlah_terdampak_jiwa",
     "jumlah_pengungsi_tertinggi",
 ]
+LOG_FEATURES = [
+    "jumlah_terdampak_rt",
+    "jumlah_terdampak_kk",
+    "jumlah_terdampak_jiwa",
+    "jumlah_pengungsi_tertinggi",
+]
+
+def _cm(x) -> int:
+    nums = re.findall(r"\d+", str(x)) if pd.notna(x) else []
+    return int(max(map(int, nums))) if nums else 0
 
 @st.cache_data
-def load_data():
-    return pd.read_csv("data_banjir_clustered.csv"), pd.read_csv("agregasi_kelurahan.csv")
+def get_df(path="banjir.csv") -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df["ketinggian_air_cm"] = df["ketinggian_air"].apply(_cm)
+    for c in FEATURES:
+        df[c] = pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0)
+    return df
 
-@st.cache_resource
-def load_model():
-    with open("kmeans_model.pkl", "rb") as f:
-        kmeans = pickle.load(f)
-    with open("scaler.pkl", "rb") as f:
-        scaler = pickle.load(f)
-    return kmeans, scaler
+def make_X(df: pd.DataFrame, use_log: bool) -> np.ndarray:
+    X = df[FEATURES].to_numpy(float)
+    if use_log:
+        cols = [FEATURES.index(c) for c in LOG_FEATURES if c in FEATURES]
+        X[:, cols] = np.log1p(X[:, cols])
+    return X
 
-def make_label_map(kmeans, scaler):
-    centers_scaled = kmeans.cluster_centers_
-    centers_asli = pd.DataFrame(scaler.inverse_transform(centers_scaled), columns=FITUR)
-    berat = int(centers_asli["jumlah_terdampak_jiwa"].idxmax())
-    lm = {c: "Banjir Ringan" for c in range(kmeans.n_clusters)}
-    lm[berat] = "Banjir Berat"
-    return lm, centers_scaled, centers_asli
+def label_map(kmeans: KMeans, scaler: StandardScaler) -> tuple[dict[int, str], pd.DataFrame]:
+    centers = pd.DataFrame(scaler.inverse_transform(kmeans.cluster_centers_), columns=FEATURES)
+    score = (
+        np.log1p(centers["jumlah_terdampak_jiwa"]) * 1.0
+        + np.log1p(centers["jumlah_terdampak_kk"]) * 0.7
+        + np.log1p(centers["jumlah_pengungsi_tertinggi"]) * 0.5
+        + np.log1p(centers["ketinggian_air_cm"]) * 0.2
+        + np.log1p(centers["jumlah_terdampak_rt"]) * 0.2
+    ).to_numpy()
 
-df, agg = load_data()
-kmeans, scaler = load_model()
-lmap, centers_scaled, centers_asli = make_label_map(kmeans, scaler)
+    thr = float(np.quantile(score, 2 / 3))
+    heavy = set(map(int, np.where(score >= thr)[0])) or {int(np.argmax(score))}
+    m = {i: ("Banjir Berat" if i in heavy else "Banjir Ringan") for i in range(kmeans.n_clusters)}
 
+    centers["severity_score"], centers["label"] = score, centers.index.map(m)
+    return m, centers.sort_values("severity_score", ascending=False)
+
+def agg_kelurahan(df: pd.DataFrame) -> pd.DataFrame:
+    g = df.groupby("kelurahan", dropna=False)
+    out = pd.DataFrame({
+        "total_kejadian": g.size(),
+        "jumlah_banjir_berat": g.apply(lambda x: (x["kategori_banjir"] == "Banjir Berat").sum()),
+    }).reset_index()
+    out["persentase_banjir_berat"] = np.where(
+        out["total_kejadian"] > 0,
+        out["jumlah_banjir_berat"] / out["total_kejadian"] * 100,
+        0.0
+    )
+    return out.sort_values("persentase_banjir_berat", ascending=False)
+
+# ============ Sidebar ============
 st.sidebar.title("Navigasi")
-menu = st.sidebar.radio("Pilih Menu", ["📊 Overview", "🗺️ Analisis Wilayah", "🔍 Hasil Klasterisasi"])
+k = st.sidebar.slider("Jumlah cluster", 2, 10, 4)
+use_log = st.sidebar.checkbox("Gunakan log1p", True)
+warn_min = st.sidebar.number_input("Peringatan cluster kecil (< data)", 1, 50, 5)
+menu = st.sidebar.radio("Menu", ["Overview", "Analisis Wilayah", "Hasil Klasterisasi"])
 
-if menu == "📊 Overview":
-    st.title("Dashboard Klasterisasi Banjir DKI Jakarta")
-    st.markdown("---")
+# ============ Data + Clustering (DINAMIS SAJA) ============
+df0 = get_df()
+X = make_X(df0, use_log)
 
+scaler = StandardScaler().fit(X)
+Xs = scaler.transform(X)
+kmeans = KMeans(n_clusters=k, random_state=42, n_init="auto").fit(Xs)
+
+df = df0.copy()
+df["cluster"] = kmeans.labels_
+lm, centers = label_map(kmeans, scaler)
+df["kategori_banjir"] = df["cluster"].map(lm)
+
+sizes = df["cluster"].value_counts().sort_index()
+if (sizes < int(warn_min)).any():
+    st.info("Ada cluster kecil. Coba turunkan k atau aktifkan log1p agar lebih stabil.")
+
+# ============ Pages ============
+st.title("Dashboard Klasterisasi Banjir DKI Jakarta")
+st.caption(f"k aktif: {k} | log1p: {use_log}")
+
+if menu == "Overview":
     c1, c2 = st.columns(2)
     with c1:
-        st.subheader("Distribusi Kategori/Cluster")
         fig, ax = plt.subplots()
-        if "kategori_banjir" in df.columns:
-            df["kategori_banjir"].value_counts().plot(kind="bar", ax=ax)
-            ax.set_xlabel("Kategori")
-        elif "cluster" in df.columns:
-            df["cluster"].value_counts().plot(kind="bar", ax=ax)
-            ax.set_xlabel("Cluster")
-        ax.set_ylabel("Jumlah Kejadian")
+        df["kategori_banjir"].value_counts().plot(kind="bar", ax=ax)
+        ax.set_xlabel("Kategori")
+        ax.set_ylabel("Jumlah")
         st.pyplot(fig)
 
     with c2:
-        st.subheader("Scatter Plot Klaster")
         fig, ax = plt.subplots()
-        hue = "kategori_banjir" if "kategori_banjir" in df.columns else ("cluster" if "cluster" in df.columns else None)
-        sns.scatterplot(data=df, x="ketinggian_air_cm", y="jumlah_terdampak_jiwa", hue=hue, ax=ax)
-        ax.set_xlabel("Ketinggian Air (cm)")
-        ax.set_ylabel("Jumlah Jiwa Terdampak")
+        sns.scatterplot(
+            data=df,
+            x="ketinggian_air_cm",
+            y="jumlah_terdampak_jiwa",
+            hue="kategori_banjir",
+            ax=ax,
+            s=35
+        )
+        ax.set_xlabel("Ketinggian (cm)")
+        ax.set_ylabel("Jiwa")
         st.pyplot(fig)
 
-    st.markdown("---")
-    st.subheader("📈 Perbandingan Karakteristik Klaster")
-    cat = "kategori_banjir" if "kategori_banjir" in df.columns else ("cluster" if "cluster" in df.columns else None)
-
-    c3, c4 = st.columns(2)
-    with c3:
-        fig, ax = plt.subplots()
-        sns.boxplot(data=df, x=cat, y="ketinggian_air_cm", ax=ax)
-        ax.set_xlabel("Kategori/Cluster")
-        ax.set_ylabel("Ketinggian Air (cm)")
-        st.pyplot(fig)
-
-    with c4:
-        fig, ax = plt.subplots()
-        sns.boxplot(data=df, x=cat, y="jumlah_terdampak_jiwa", ax=ax)
-        ax.set_xlabel("Kategori/Cluster")
-        ax.set_ylabel("Jumlah Jiwa")
-        st.pyplot(fig)
-
-    st.markdown("### 🔥 Ringkasan Rata-rata Variabel per Klaster")
-    cluster_mean = df.groupby(cat)[FITUR].mean(numeric_only=True)
-    fig, ax = plt.subplots(figsize=(8, 4))
-    sns.heatmap(cluster_mean, annot=True, fmt=".1f", ax=ax)
+    st.subheader("Ukuran Cluster")
+    fig, ax = plt.subplots()
+    ax.bar(sizes.index.astype(str), sizes.values)
+    ax.set_xlabel("Cluster")
+    ax.set_ylabel("Jumlah Data")
     st.pyplot(fig)
 
-elif menu == "🗺️ Analisis Wilayah":
-    st.title("Analisis Banjir per Kelurahan")
-    st.markdown("---")
-    top_n = st.slider("Tampilkan Top N Kelurahan", 5, 20, 10)
-    top = agg.sort_values("persentase_banjir_berat", ascending=False).head(top_n)
-    st.subheader("Tabel Agregasi Kelurahan")
+elif menu == "Analisis Wilayah":
+    top_n = st.slider("Top N Kelurahan", 5, 30, 10)
+    top = agg_kelurahan(df).head(top_n)
     st.dataframe(top, use_container_width=True)
-    st.subheader("Persentase Banjir Berat")
+
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.barh(top["kelurahan"], top["persentase_banjir_berat"])
-    ax.set_xlabel("Persentase (%)")
+    ax.barh(top["kelurahan"].astype(str), top["persentase_banjir_berat"])
+    ax.set_xlabel("Persentase Banjir Berat (%)")
     ax.invert_yaxis()
     st.pyplot(fig)
 
 else:
-    st.title("Hasil Klasterisasi Data Banjir (Dataset)")
-    st.markdown("---")
-
-    X = df[FITUR].apply(pd.to_numeric, errors="coerce").fillna(0)
-    X_scaled = scaler.transform(X)
-
-    if "cluster" not in df.columns:
-        df["cluster"] = kmeans.predict(X_scaled)
-
-    df["kategori_banjir"] = df["cluster"].map(lmap)
-
-    pca = PCA(n_components=2, random_state=42)
-    X_pca = pca.fit_transform(X_scaled)
-    centers_pca = pca.transform(centers_scaled)
-    pc1 = pca.explained_variance_ratio_[0] * 100
-    pc2 = pca.explained_variance_ratio_[1] * 100
-
-    st.subheader("PCA Cluster Plot")
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for name, sub in df.groupby("kategori_banjir"):
-        idx = sub.index.to_numpy()
-        ax.scatter(X_pca[idx, 0], X_pca[idx, 1], s=35, alpha=0.7, label=name)
-    ax.scatter(centers_pca[:, 0], centers_pca[:, 1], s=260, marker="X", c="black", label="Cluster Centers")
-    ax.set_xlabel(f"PC1 ({pc1:.1f}% variance)")
-    ax.set_ylabel(f"PC2 ({pc2:.1f}% variance)")
-    ax.grid(True, alpha=0.25)
-    ax.legend(loc="upper right")
-    st.pyplot(fig)
-
-    st.markdown("---")
     st.subheader("Ringkasan Cluster")
-    ringkas = df.groupby(["cluster", "kategori_banjir"])[FITUR].mean(numeric_only=True).reset_index()
-    ukuran = df.groupby(["cluster", "kategori_banjir"]).size().reset_index(name="jumlah_data")
-    ringkas = ukuran.merge(ringkas, on=["cluster", "kategori_banjir"]).sort_values("cluster")
-    st.dataframe(ringkas, use_container_width=True)
-
-    st.subheader("Detailed Cluster Analysis")
-    d_all = np.linalg.norm(X_scaled[:, None, :] - centers_scaled[None, :, :], axis=2)
-
-    for c in range(kmeans.n_clusters):
-        nama = lmap.get(c, f"Cluster {c}")
-        n = int((df["cluster"] == c).sum())
-        with st.expander(f"● Cluster {c} - {nama} ({n} data)"):
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("**Centroid (skala asli)**")
-                st.dataframe(centers_asli.iloc[[c]].T.rename(columns={c: "nilai"}), use_container_width=True)
-            with col2:
-                st.markdown("**Mean data pada cluster (skala asli)**")
-                st.dataframe(X[df["cluster"] == c].mean().to_frame("mean"), use_container_width=True)
-
-            idx_cluster = np.where(df["cluster"].values == c)[0]
-            if len(idx_cluster) == 0:
-                st.info("Tidak ada data.")
-            else:
-                dist_c = d_all[idx_cluster, c]
-                pick = idx_cluster[np.argsort(dist_c)[:10]]
-                cols_show = [col for col in ["kelurahan", "kecamatan", "tanggal", "waktu", "lokasi"] if col in df.columns]
-                cols_show += FITUR + ["cluster", "kategori_banjir"]
-                st.markdown("**Contoh 10 data paling representatif**")
-                st.dataframe(df.iloc[pick][cols_show], use_container_width=True)
-
-    st.markdown("---")
-    st.subheader("Download Results")
-    st.download_button(
-        "Download Clustered Data as CSV",
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name="data_banjir_hasil_cluster.csv",
-        mime="text/csv"
+    summ = (
+        df.groupby(["cluster", "kategori_banjir"])
+        .agg(jumlah_data=("cluster", "size"), **{c: (c, "mean") for c in FEATURES})
+        .reset_index()
+    )
+    st.dataframe(
+        summ.sort_values(["kategori_banjir", "jumlah_data"], ascending=[True, False]).round(2),
+        use_container_width=True
     )
 
-st.markdown("---")
-st.caption("Aplikasi Klasterisasi Banjir - K-Means | Data Publik DKI Jakarta")
+    st.subheader("Centroid & Severity")
+    st.dataframe(centers.round(2), use_container_width=True)
+
+    st.subheader("PCA (ringkas)")
+    Z = PCA(n_components=2, random_state=42).fit_transform(Xs)
+    fig, ax = plt.subplots(figsize=(9, 5))
+    sns.scatterplot(x=Z[:, 0], y=Z[:, 1], hue=df["kategori_banjir"], ax=ax, s=30, alpha=0.8)
+    ax.set_xlabel("PC1")
+    ax.set_ylabel("PC2")
+    st.pyplot(fig)
+
+    st.subheader("Download")
+    st.download_button(
+        "Clustered CSV",
+        df.to_csv(index=False).encode("utf-8"),
+        f"data_cluster_k{k}.csv",
+        "text/csv"
+    )
+
+    buf = io.BytesIO()
+    pickle.dump(kmeans, buf)
+    st.download_button(
+        "Model PKL",
+        buf.getvalue(),
+        f"kmeans_k{k}.pkl",
+        "application/octet-stream"
+    )
+
+    buf = io.BytesIO()
+    pickle.dump(scaler, buf)
+    st.download_button(
+        "Scaler PKL",
+        buf.getvalue(),
+        "scaler.pkl",
+        "application/octet-stream"
+    )
